@@ -14,7 +14,6 @@
 
 import asyncio
 import logging
-import os
 import sqlite3
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
@@ -29,17 +28,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import CommandStart, Command
 
 # ─── НАСТРОЙКИ ────────────────────────────────────────────────────────────────
-# Задаются через переменные окружения Railway (или .env локально)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")          # Токен от @BotFather
-OWNER_ID  = int(os.getenv("OWNER_ID", "0"))     # Ваш Telegram ID от @userinfobot
+BOT_TOKEN = "8437642100:AAF6NL71wkN77uctXCgTGLFHf1gITDD57-M"          # Токен от @BotFather
+OWNER_ID  = 125380747             # Ваш Telegram ID от @userinfobot
 DB_FILE   = "housemaster.db"
-PHONE     = os.getenv("PHONE", "+7 (XXX) XXX-XX-XX")   # Телефон Хаус Мастер
-CITY      = os.getenv("CITY", "по всей России")          # Зона охвата
-
-if not BOT_TOKEN:
-    raise ValueError("Переменная BOT_TOKEN не задана! Добавь её в Railway → Variables")
-if not OWNER_ID:
-    raise ValueError("Переменная OWNER_ID не задана! Добавь её в Railway → Variables")
+PHONE     = "+7 (992) 350-80-08" # Телефон Хаус Мастер
+CITY      = "по всей России"      # Зона охвата
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
