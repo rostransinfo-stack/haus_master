@@ -1,9 +1,10 @@
 """
-Хаус Мастер — Telegram Bot v1.0
-Архитектура на базе VTehnike 24 bot v10.0
+Хаус Мастер — Telegram Bot v2.0
 
-+ SQLite база данных (не теряется при передеплое)
++ SQLite база данных
 + Два типа заявок: разовый ремонт и регулярное обслуживание
++ Роль исполнителя (мастера) — принимает/отказывается от заявок
++ Распределение заявок между мастерами (кто первый принял)
 + Статусы заявок с уведомлением клиенту
 + Отзыв после выполнения
 + Рассылка всем пользователям
@@ -33,6 +34,12 @@ OWNER_ID  = 125380747             # Ваш Telegram ID от @userinfobot
 DB_FILE   = "housemaster.db"
 PHONE     = "+7 (992) 350-80-08" # Телефон Хаус Мастер
 CITY      = "по всей России"      # Зона охвата
+
+# ID мастеров — добавляй Telegram ID исполнителей
+MASTER_IDS = [
+    # 111111111,
+    # 222222222,
+]
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +69,8 @@ def db_init():
                 order_type  TEXT,
                 summary     TEXT,
                 status      TEXT DEFAULT 'принята',
+                master_id   INTEGER DEFAULT NULL,
+                master_name TEXT DEFAULT NULL,
                 created_at  TEXT,
                 updated_at  TEXT
             )
@@ -74,6 +83,15 @@ def db_init():
                 rating      INTEGER,
                 comment     TEXT,
                 created_at  TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS masters (
+                id            INTEGER PRIMARY KEY,
+                name          TEXT,
+                username      TEXT,
+                phone         TEXT,
+                registered_at TEXT
             )
         """)
         con.commit()
@@ -116,6 +134,22 @@ def db_update_status(order_id: int, status: str):
         )
         con.commit()
 
+def db_assign_master(order_id: int, master_id: int, master_name: str) -> bool:
+    """Назначить мастера. Возвращает True если заявка ещё свободна."""
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    with db_connect() as con:
+        row = con.execute(
+            "SELECT master_id, status FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+        if not row or row[0] is not None or row[1] != "принята":
+            return False
+        con.execute(
+            "UPDATE orders SET master_id=?, master_name=?, status='в работе', updated_at=? WHERE id=?",
+            (master_id, master_name, now, order_id)
+        )
+        con.commit()
+        return True
+
 def db_get_order(order_id: int):
     with db_connect() as con:
         return con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
@@ -129,54 +163,39 @@ def db_add_review(user_id: int, order_id: int, rating: int, comment: str):
         )
         con.commit()
 
-def db_get_stats() -> str:
+def db_get_master_orders(master_id: int) -> list:
     with db_connect() as con:
-        total_users   = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        total_orders  = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-        onetime_cnt   = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='onetime'").fetchone()[0]
-        regular_cnt   = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='regular'").fetchone()[0]
-        done_cnt      = con.execute("SELECT COUNT(*) FROM orders WHERE status='выполнено'").fetchone()[0]
-        avg_rating    = con.execute("SELECT AVG(rating) FROM reviews").fetchone()[0]
-        review_cnt    = con.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
-        recent = con.execute(
-            "SELECT name, username, last_seen FROM users ORDER BY last_seen DESC LIMIT 5"
+        return con.execute(
+            """SELECT id, order_type, status, created_at, summary
+               FROM orders WHERE master_id=?
+               ORDER BY created_at DESC LIMIT 10""",
+            (master_id,)
         ).fetchall()
-    rating_str = f"{avg_rating:.1f} / 5 ({review_cnt} отзывов)" if avg_rating else "пока нет"
-    recent_str = ""
-    for name, username, last_seen in recent:
-        tag = f"@{username}" if username else ""
-        recent_str += f"  {name} {tag} — был {last_seen}\n"
-    return (
-        f"📊 Статистика Хаус Мастер\n\n"
-        f"Пользователей:       {total_users}\n"
-        f"Всего заявок:        {total_orders}\n"
-        f"  разовый ремонт:    {onetime_cnt}\n"
-        f"  регулярное обсл.:  {regular_cnt}\n"
-        f"  выполнено:         {done_cnt}\n"
-        f"Средний отзыв:       {rating_str}\n\n"
-        f"Последние 5 активных:\n{recent_str}"
-    )
 
-def db_get_weekly_stats() -> str:
+def db_get_active_orders() -> list:
     with db_connect() as con:
-        week_ago = (datetime.now() - timedelta(days=7)).strftime("%d.%m.%Y")
-        new_users    = con.execute("SELECT COUNT(*) FROM users WHERE first_seen >= ?", (week_ago,)).fetchone()[0]
-        new_orders   = con.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (week_ago,)).fetchone()[0]
-        onetime_cnt  = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='onetime' AND created_at >= ?", (week_ago,)).fetchone()[0]
-        regular_cnt  = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='regular' AND created_at >= ?", (week_ago,)).fetchone()[0]
-        done_cnt     = con.execute("SELECT COUNT(*) FROM orders WHERE status='выполнено' AND updated_at >= ?", (week_ago,)).fetchone()[0]
-        avg_rating   = con.execute("SELECT AVG(rating) FROM reviews WHERE created_at >= ?", (week_ago,)).fetchone()[0]
-    rating_str = f"{avg_rating:.1f}/5" if avg_rating else "нет"
-    return (
-        f"📅 Сводка за 7 дней\n"
-        f"{datetime.now().strftime('%d.%m.%Y')}\n\n"
-        f"Новых пользователей: {new_users}\n"
-        f"Новых заявок:        {new_orders}\n"
-        f"  разовый ремонт:    {onetime_cnt}\n"
-        f"  регулярное обсл.:  {regular_cnt}\n"
-        f"Выполнено:           {done_cnt}\n"
-        f"Средний отзыв:       {rating_str}"
-    )
+        return con.execute(
+            """SELECT o.id, o.user_id, o.order_type, o.status, o.created_at,
+                      u.name, u.username, o.master_name
+               FROM orders o
+               LEFT JOIN users u ON o.user_id = u.id
+               WHERE o.status NOT IN ('выполнено', 'отменена')
+               ORDER BY o.created_at DESC"""
+        ).fetchall()
+
+def db_get_client_orders(user_id: int) -> list:
+    with db_connect() as con:
+        return con.execute(
+            """SELECT id, order_type, status, created_at, master_name
+               FROM orders WHERE user_id=?
+               ORDER BY created_at DESC LIMIT 10""",
+            (user_id,)
+        ).fetchall()
+
+def db_get_all_user_ids() -> list:
+    with db_connect() as con:
+        rows = con.execute("SELECT id FROM users").fetchall()
+    return [r[0] for r in rows]
 
 def db_get_pending_orders(minutes: int = 120) -> list:
     with db_connect() as con:
@@ -194,75 +213,95 @@ def db_get_pending_orders(minutes: int = 120) -> list:
             pass
     return result
 
-def db_get_active_orders() -> list:
+def db_get_stats() -> str:
     with db_connect() as con:
-        rows = con.execute(
-            """SELECT o.id, o.user_id, o.order_type, o.status, o.created_at,
-                      u.name, u.username
-               FROM orders o
-               LEFT JOIN users u ON o.user_id = u.id
-               WHERE o.status NOT IN ('выполнено', 'отменена')
-               ORDER BY o.created_at DESC"""
+        total_users  = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_orders = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        onetime_cnt  = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='onetime'").fetchone()[0]
+        regular_cnt  = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='regular'").fetchone()[0]
+        done_cnt     = con.execute("SELECT COUNT(*) FROM orders WHERE status='выполнено'").fetchone()[0]
+        master_cnt   = con.execute("SELECT COUNT(*) FROM masters").fetchone()[0]
+        avg_rating   = con.execute("SELECT AVG(rating) FROM reviews").fetchone()[0]
+        review_cnt   = con.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+        recent = con.execute(
+            "SELECT name, username, last_seen FROM users ORDER BY last_seen DESC LIMIT 5"
         ).fetchall()
-    return rows
+    rating_str = f"{avg_rating:.1f} / 5 ({review_cnt} отзывов)" if avg_rating else "пока нет"
+    recent_str = ""
+    for name, username, last_seen in recent:
+        tag = f"@{username}" if username else ""
+        recent_str += f"  {name} {tag} — {last_seen}\n"
+    return (
+        f"📊 Статистика Хаус Мастер\n\n"
+        f"Пользователей:       {total_users}\n"
+        f"Мастеров:            {master_cnt}\n"
+        f"Всего заявок:        {total_orders}\n"
+        f"  разовый ремонт:    {onetime_cnt}\n"
+        f"  регулярное обсл.:  {regular_cnt}\n"
+        f"  выполнено:         {done_cnt}\n"
+        f"Средний отзыв:       {rating_str}\n\n"
+        f"Последние 5 активных:\n{recent_str}"
+    )
 
-def db_get_order_user_id(order_id: int) -> int:
+def db_get_weekly_stats() -> str:
     with db_connect() as con:
-        row = con.execute("SELECT user_id FROM orders WHERE id=?", (order_id,)).fetchone()
-    return row[0] if row else None
+        week_ago    = (datetime.now() - timedelta(days=7)).strftime("%d.%m.%Y")
+        new_users   = con.execute("SELECT COUNT(*) FROM users WHERE first_seen >= ?", (week_ago,)).fetchone()[0]
+        new_orders  = con.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (week_ago,)).fetchone()[0]
+        onetime_cnt = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='onetime' AND created_at >= ?", (week_ago,)).fetchone()[0]
+        regular_cnt = con.execute("SELECT COUNT(*) FROM orders WHERE order_type='regular' AND created_at >= ?", (week_ago,)).fetchone()[0]
+        done_cnt    = con.execute("SELECT COUNT(*) FROM orders WHERE status='выполнено' AND updated_at >= ?", (week_ago,)).fetchone()[0]
+        avg_rating  = con.execute("SELECT AVG(rating) FROM reviews WHERE created_at >= ?", (week_ago,)).fetchone()[0]
+    rating_str = f"{avg_rating:.1f}/5" if avg_rating else "нет"
+    return (
+        f"📅 Сводка за 7 дней\n{datetime.now().strftime('%d.%m.%Y')}\n\n"
+        f"Новых пользователей: {new_users}\n"
+        f"Новых заявок:        {new_orders}\n"
+        f"  разовый ремонт:    {onetime_cnt}\n"
+        f"  регулярное обсл.:  {regular_cnt}\n"
+        f"Выполнено:           {done_cnt}\n"
+        f"Средний отзыв:       {rating_str}"
+    )
 
-def db_get_client_orders(user_id: int) -> list:
-    with db_connect() as con:
-        rows = con.execute(
-            """SELECT id, order_type, status, created_at
-               FROM orders WHERE user_id=?
-               ORDER BY created_at DESC LIMIT 10""",
-            (user_id,)
-        ).fetchall()
-    return rows
-
-def db_get_all_user_ids() -> list:
-    with db_connect() as con:
-        rows = con.execute("SELECT id FROM users").fetchall()
-    return [r[0] for r in rows]
-
-# ─── РАБОЧЕЕ ВРЕМЯ ────────────────────────────────────────────────────────────
+# ─── РАБОЧЕЕ ВРЕМЯ / РОЛИ ─────────────────────────────────────────────────────
 def is_working_hours() -> bool:
-    """Пн-Сб 8:00-21:00"""
     now = datetime.now()
     if now.weekday() == 6:
         return False
     return 8 <= now.hour < 21
 
-# ─── ДАННЫЕ — УСЛУГИ ──────────────────────────────────────────────────────────
+def is_master(user_id: int) -> bool:
+    return user_id in MASTER_IDS
+
+# ─── УСЛУГИ ───────────────────────────────────────────────────────────────────
 ONETIME_SERVICES = {
-    "lamp":        {"name": "🔦 Замена ламп / люстр",         "price": "от 500 руб.",    "time": "30 мин"},
-    "furniture":   {"name": "🪑 Сборка / ремонт мебели",      "price": "от 1 000 руб.",  "time": "1-3 часа"},
-    "paint":       {"name": "🎨 Подкраска стен и поверхностей","price": "от 1 500 руб.",  "time": "1-4 часа"},
-    "plumbing":    {"name": "🚿 Сантехника (кран, унитаз)",    "price": "от 1 500 руб.",  "time": "1-2 часа"},
-    "door":        {"name": "🚪 Установка / регулировка дверей","price": "от 1 000 руб.", "time": "1-2 часа"},
-    "shelf":       {"name": "📦 Полки, карнизы, крючки",       "price": "от 500 руб.",   "time": "30-60 мин"},
-    "tv":          {"name": "📺 Крепление ТВ на стену",        "price": "от 1 500 руб.",  "time": "1 час"},
-    "tile":        {"name": "🧱 Укладка / замена плитки",      "price": "от 3 000 руб.",  "time": "от 2 часов"},
-    "electrical":  {"name": "⚡ Электрика (розетки, выключат.)","price": "от 1 000 руб.", "time": "1-2 часа"},
-    "floor":       {"name": "🪵 Скрип пола / ламинат",         "price": "от 2 000 руб.",  "time": "от 2 часов"},
-    "caulk":       {"name": "🪟 Герметизация окон / щелей",    "price": "от 800 руб.",    "time": "1 час"},
-    "other":       {"name": "🔨 Другое — уточним",             "price": "по договорённости","time": "уточним"},
+    "lamp":       {"name": "🔦 Замена ламп / люстр",          "price": "от 500 руб.",      "time": "30 мин"},
+    "furniture":  {"name": "🪑 Сборка / ремонт мебели",       "price": "от 1 000 руб.",    "time": "1-3 часа"},
+    "paint":      {"name": "🎨 Подкраска стен и поверхностей", "price": "от 1 500 руб.",    "time": "1-4 часа"},
+    "plumbing":   {"name": "🚿 Сантехника (кран, унитаз)",     "price": "от 1 500 руб.",    "time": "1-2 часа"},
+    "door":       {"name": "🚪 Установка / регулировка дверей","price": "от 1 000 руб.",    "time": "1-2 часа"},
+    "shelf":      {"name": "📦 Полки, карнизы, крючки",        "price": "от 500 руб.",      "time": "30-60 мин"},
+    "tv":         {"name": "📺 Крепление ТВ на стену",         "price": "от 1 500 руб.",    "time": "1 час"},
+    "tile":       {"name": "🧱 Укладка / замена плитки",       "price": "от 3 000 руб.",    "time": "от 2 часов"},
+    "electrical": {"name": "⚡ Электрика (розетки, выключат.)","price": "от 1 000 руб.",    "time": "1-2 часа"},
+    "floor":      {"name": "🪵 Скрип пола / ламинат",          "price": "от 2 000 руб.",    "time": "от 2 часов"},
+    "caulk":      {"name": "🪟 Герметизация окон / щелей",     "price": "от 800 руб.",      "time": "1 час"},
+    "other":      {"name": "🔨 Другое — уточним",              "price": "по договорённости","time": "уточним"},
 }
 
 REGULAR_SERVICES = {
-    "cafe_basic":    {"name": "☕ Кафе / ресторан — базовый пакет",  "price": "от 8 000 руб./мес.",  "visits": "2 раза/мес."},
-    "cafe_full":     {"name": "☕ Кафе / ресторан — полный пакет",   "price": "от 15 000 руб./мес.", "visits": "еженедельно"},
-    "office_basic":  {"name": "🏢 Офис — базовый пакет",             "price": "от 5 000 руб./мес.",  "visits": "2 раза/мес."},
-    "office_full":   {"name": "🏢 Офис — полный пакет",              "price": "от 10 000 руб./мес.", "visits": "еженедельно"},
-    "apartment":     {"name": "🏠 Квартира / дом",                   "price": "от 3 000 руб./мес.",  "visits": "1 раз/мес."},
-    "custom":        {"name": "📋 Индивидуальные условия",           "price": "по договорённости",    "visits": "по согласованию"},
+    "cafe_basic":   {"name": "☕ Кафе / ресторан — базовый",  "price": "от 8 000 руб./мес.",  "visits": "2 раза/мес."},
+    "cafe_full":    {"name": "☕ Кафе / ресторан — полный",   "price": "от 15 000 руб./мес.", "visits": "еженедельно"},
+    "office_basic": {"name": "🏢 Офис — базовый пакет",       "price": "от 5 000 руб./мес.",  "visits": "2 раза/мес."},
+    "office_full":  {"name": "🏢 Офис — полный пакет",        "price": "от 10 000 руб./мес.", "visits": "еженедельно"},
+    "apartment":    {"name": "🏠 Квартира / дом",             "price": "от 3 000 руб./мес.",  "visits": "1 раз/мес."},
+    "custom":       {"name": "📋 Индивидуальные условия",     "price": "по договорённости",   "visits": "по согласованию"},
 }
 
 URGENCY = {
-    "standard": {"name": "Стандарт (1-2 дня)",        "mult": "x1"},
-    "urgent":   {"name": "Срочно (сегодня) +30%",     "mult": "+30%"},
-    "express":  {"name": "Экстренно (2 часа) +60%",   "mult": "+60%"},
+    "standard": {"name": "📅 Стандарт (1-2 дня)",      "mult": "x1"},
+    "urgent":   {"name": "⚡ Срочно (сегодня) +30%",   "mult": "+30%"},
+    "express":  {"name": "🚨 Экстренно (2 часа) +60%", "mult": "+60%"},
 }
 
 PAYMENT = {
@@ -273,22 +312,22 @@ PAYMENT = {
 }
 
 ORDER_STATUSES = {
-    "принята":   "Заявка принята, скоро свяжемся",
-    "в работе":  "Мастер назначен, едет к вам",
+    "принята":   "Заявка принята, ищем мастера",
+    "в работе":  "Мастер назначен и едет к вам",
     "выполнено": "Работа выполнена",
     "отменена":  "Заявка отменена",
 }
 
 # ─── СОСТОЯНИЯ ────────────────────────────────────────────────────────────────
 class Order(StatesGroup):
-    choosing_service  = State()   # выбор услуги разового ремонта
-    choosing_regular  = State()   # выбор пакета регулярного обслуживания
-    choosing_urgency  = State()   # срочность (только для разового)
-    entering_address  = State()   # адрес
-    entering_phone    = State()   # телефон
-    choosing_payment  = State()   # способ оплаты
-    entering_comment  = State()   # комментарий
-    confirm           = State()   # подтверждение
+    choosing_service  = State()
+    choosing_regular  = State()
+    choosing_urgency  = State()
+    entering_address  = State()
+    entering_phone    = State()
+    choosing_payment  = State()
+    entering_comment  = State()
+    confirm           = State()
 
 class OwnerReply(StatesGroup):
     waiting_message = State()
@@ -315,38 +354,74 @@ def order_summary(data: dict) -> str:
         lines.append(f"Периодичность: {svc.get('visits', '—')}")
     lines.append(f"Адрес: {data.get('address', '—')}")
     lines.append(f"Телефон: {data.get('phone', '—')}")
-    lines.append(f"Оплата: {PAYMENT.get(data.get('payment','cash'), {}).get('name', '—')}")
+    lines.append(f"Оплата: {PAYMENT.get(data.get('payment', 'cash'), {}).get('name', '—')}")
     comment = data.get("comment", "нет")
     if comment and comment != "нет":
         lines.append(f"Комментарий: {comment}")
     return "\n".join(lines)
 
 async def notify_owner(data: dict, user, order_id: int):
-    order_type = data.get("order_type", "onetime")
-    label = "РАЗОВЫЙ" if order_type == "onetime" else "РЕГУЛЯРНОЕ"
-    tag = f"@{user.username}" if user.username else f"ID: {user.id}"
-    header = (
-        f"🆕 НОВАЯ ЗАЯВКА #{order_id} — {label}\n"
-        f"Клиент: {user.full_name} ({tag})\n\n"
-    )
-    body = order_summary(data)
+    label = "РАЗОВЫЙ" if data.get("order_type") == "onetime" else "РЕГУЛЯРНОЕ"
+    tag   = f"@{user.username}" if user.username else f"ID: {user.id}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ В работу",         callback_data=f"ss_{order_id}_{user.id}_inwork")],
         [InlineKeyboardButton(text="✅ Выполнено",         callback_data=f"ss_{order_id}_{user.id}_done")],
         [InlineKeyboardButton(text="💬 Написать клиенту",  callback_data=f"msg_{order_id}_{user.id}")],
         [InlineKeyboardButton(text="❌ Отменить",          callback_data=f"ss_{order_id}_{user.id}_cancel")],
     ])
-    await bot.send_message(OWNER_ID, header + body, reply_markup=kb)
+    await bot.send_message(
+        OWNER_ID,
+        f"🆕 НОВАЯ ЗАЯВКА #{order_id} — {label}\n"
+        f"Клиент: {user.full_name} ({tag})\n\n"
+        + order_summary(data),
+        reply_markup=kb
+    )
+
+async def notify_masters(data: dict, user, order_id: int):
+    """Разослать заявку всем мастерам — кто первый нажмёт, тот берёт."""
+    if not MASTER_IDS:
+        return
+    label = "РАЗОВЫЙ" if data.get("order_type") == "onetime" else "РЕГУЛЯРНОЕ"
+    tag   = f"@{user.username}" if user.username else f"клиент ID: {user.id}"
+    if data.get("order_type") == "onetime":
+        svc = ONETIME_SERVICES.get(data.get("service", ""), {})
+        urg = URGENCY.get(data.get("urgency", "standard"), {})
+        details = f"Услуга: {svc.get('name','—')}\nСрочность: {urg.get('name','—')}"
+    else:
+        svc = REGULAR_SERVICES.get(data.get("regular_service", ""), {})
+        details = f"Пакет: {svc.get('name','—')}\nСтоимость: {svc.get('price','—')}"
+    text = (
+        f"🔔 НОВАЯ ЗАЯВКА #{order_id} — {label}\n\n"
+        f"{details}\n"
+        f"Адрес: {data.get('address','—')}\n"
+        f"Клиент: {tag}\n\n"
+        f"Возьмёшь заказ?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять заявку", callback_data=f"take_{order_id}")],
+        [InlineKeyboardButton(text="❌ Отказаться",     callback_data=f"skip_{order_id}")],
+    ])
+    for master_id in MASTER_IDS:
+        try:
+            await bot.send_message(master_id, text, reply_markup=kb)
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить мастера {master_id}: {e}")
 
 # ─── КЛАВИАТУРЫ ───────────────────────────────────────────────────────────────
 def kb_main():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔧 Разовый ремонт",        callback_data="start_onetime")],
-        [InlineKeyboardButton(text="🔄 Регулярное обслуживание",callback_data="start_regular")],
-        [InlineKeyboardButton(text="📋 Мои заявки",             callback_data="my_orders")],
-        [InlineKeyboardButton(text="📞 Перезвоните мне",        callback_data="callback_request")],
-        [InlineKeyboardButton(text="💰 Прайс-лист",             callback_data="show_prices")],
-        [InlineKeyboardButton(text="☎️ Позвонить нам",          callback_data="call_us")],
+        [InlineKeyboardButton(text="🔧 Разовый ремонт",         callback_data="start_onetime")],
+        [InlineKeyboardButton(text="🔄 Регулярное обслуживание", callback_data="start_regular")],
+        [InlineKeyboardButton(text="📋 Мои заявки",              callback_data="my_orders")],
+        [InlineKeyboardButton(text="📞 Перезвоните мне",         callback_data="callback_request")],
+        [InlineKeyboardButton(text="💰 Прайс-лист",              callback_data="show_prices")],
+        [InlineKeyboardButton(text="☎️ Позвонить нам",           callback_data="call_us")],
+    ])
+
+def kb_master_main():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Мои задачи",     callback_data="master_tasks")],
+        [InlineKeyboardButton(text="📊 Моя статистика", callback_data="master_stats")],
     ])
 
 def kb_onetime_services():
@@ -381,10 +456,10 @@ def kb_urgency():
 
 def kb_payment():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 Наличные",      callback_data="pay_cash")],
-        [InlineKeyboardButton(text="💳 Карта / СБП",   callback_data="pay_card")],
-        [InlineKeyboardButton(text="🏦 Безнал с НДС",  callback_data="pay_bank_nds")],
-        [InlineKeyboardButton(text="🏦 Безнал без НДС",callback_data="pay_bank_nonds")],
+        [InlineKeyboardButton(text="💵 Наличные",       callback_data="pay_cash")],
+        [InlineKeyboardButton(text="💳 Карта / СБП",    callback_data="pay_card")],
+        [InlineKeyboardButton(text="🏦 Безнал с НДС",   callback_data="pay_bank_nds")],
+        [InlineKeyboardButton(text="🏦 Безнал без НДС", callback_data="pay_bank_nonds")],
     ])
 
 def kb_skip():
@@ -425,52 +500,168 @@ def kb_review_comment():
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    user_id = message.from_user.id
+
+    # Мастер
+    if is_master(user_id):
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        with db_connect() as con:
+            con.execute(
+                "INSERT OR IGNORE INTO masters (id, name, username, registered_at) VALUES (?,?,?,?)",
+                (user_id, message.from_user.full_name, message.from_user.username or "", now)
+            )
+            con.commit()
+        await message.answer(
+            f"👷 Привет, мастер {message.from_user.first_name}!\n\n"
+            f"Здесь ты будешь получать заявки от клиентов.\n"
+            f"Как только появится заказ — пришлю уведомление.\n\nУдачной работы! 💪",
+            reply_markup=kb_master_main()
+        )
+        return
+
+    # Владелец
+    if user_id == OWNER_ID:
+        await message.answer(
+            f"👑 Привет, шеф!\n\n"
+            f"/orders — активные заявки\n"
+            f"/stats — статистика\n"
+            f"/week — сводка за 7 дней\n"
+            f"/masters — список мастеров\n"
+            f"/broadcast [текст] — рассылка\n",
+            reply_markup=kb_main()
+        )
+        return
+
+    # Клиент
     db_track_user(message.from_user)
     name = message.from_user.first_name or "Гость"
     off_hours_note = ""
     if not is_working_hours():
         off_hours_note = (
-            "\n⚠️ Сейчас мы не работаем (Пн-Сб 8:00-21:00).\n"
+            f"\n⚠️ Сейчас мы не работаем (Пн-Сб 8:00-21:00).\n"
             f"Заявку можно оставить — ответим утром!\nЭкстренно: {PHONE}\n"
         )
     await message.answer(
         f"Привет, {name}! 👋 Добро пожаловать в Хаус Мастер!\n\n"
-        "Мы быстро решаем бытовые задачи:\n"
-        "🔦 Лампы, мебель, сантехника, электрика\n"
-        "🎨 Подкраска, герметизация, плитка\n"
-        "🔄 Регулярное обслуживание кафе и офисов\n\n"
-        "✅ Приедем в удобное время\n"
-        "✅ Фиксированные цены без скрытых доплат\n"
-        "✅ Гарантия на все работы\n"
+        f"Быстро решаем бытовые задачи:\n"
+        f"🔦 Лампы, мебель, сантехника, электрика\n"
+        f"🎨 Подкраска, герметизация, плитка\n"
+        f"🔄 Регулярное обслуживание кафе и офисов\n\n"
+        f"✅ Приедем в удобное время\n"
+        f"✅ Фиксированные цены без доплат\n"
+        f"✅ Гарантия на все работы\n"
         + off_hours_note +
         "\nЧем могу помочь?",
         reply_markup=kb_main()
     )
 
-# ─── КОМАНДЫ ВЛАДЕЛЬЦА ────────────────────────────────────────────────────────
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    if message.from_user.id == OWNER_ID:
-        await message.answer(
-            "Команды владельца:\n\n"
-            "/orders — активные заявки\n"
-            "/stats — статистика всего времени\n"
-            "/week — сводка за 7 дней\n"
-            "/status [№] [статус] — сменить статус\n"
-            "/broadcast [текст] — рассылка всем\n"
-            "/prices — прайс услуг\n"
-            "/contacts — контакты\n\n"
-            "Статусы: принята, в работе, выполнено, отменена"
-        )
-    else:
-        await message.answer(
-            "Доступные команды:\n\n"
-            "/start — главное меню\n"
-            "/prices — прайс на услуги\n"
-            "/contacts — наши контакты",
-            reply_markup=kb_main()
-        )
+# ─── МАСТЕР — ЗАДАЧИ И СТАТИСТИКА ────────────────────────────────────────────
+@dp.callback_query(F.data == "master_tasks")
+async def master_tasks(cb: CallbackQuery):
+    if not is_master(cb.from_user.id):
+        return
+    rows = db_get_master_orders(cb.from_user.id)
+    if not rows:
+        await cb.message.answer("У тебя пока нет заявок. Жди новых! 🔔")
+        await cb.answer()
+        return
+    emoji_map = {"принята": "🆕", "в работе": "🔧", "выполнено": "✅", "отменена": "❌"}
+    text = "📋 Твои заявки:\n\n"
+    for row in rows:
+        order_id, order_type, status, created_at, summary = row
+        label = "Регулярное" if order_type == "regular" else "Разовый"
+        text += f"{emoji_map.get(status,'📋')} #{order_id} — {label}\n   Статус: {status}\n   Дата: {created_at}\n\n"
+    await cb.message.answer(text)
+    await cb.answer()
 
+@dp.callback_query(F.data == "master_stats")
+async def master_stats(cb: CallbackQuery):
+    if not is_master(cb.from_user.id):
+        return
+    with db_connect() as con:
+        total = con.execute("SELECT COUNT(*) FROM orders WHERE master_id=?", (cb.from_user.id,)).fetchone()[0]
+        done  = con.execute("SELECT COUNT(*) FROM orders WHERE master_id=? AND status='выполнено'", (cb.from_user.id,)).fetchone()[0]
+        avg   = con.execute(
+            "SELECT AVG(r.rating) FROM reviews r JOIN orders o ON r.order_id=o.id WHERE o.master_id=?",
+            (cb.from_user.id,)
+        ).fetchone()[0]
+    rating_str = f"{avg:.1f}/5" if avg else "пока нет"
+    await cb.message.answer(
+        f"📊 Твоя статистика:\n\n"
+        f"Всего заявок:   {total}\n"
+        f"Выполнено:      {done}\n"
+        f"Средний отзыв:  {rating_str}"
+    )
+    await cb.answer()
+
+# ─── МАСТЕР — ПРИНЯТЬ / ОТКАЗАТЬСЯ ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("take_"))
+async def master_take_order(cb: CallbackQuery):
+    if not is_master(cb.from_user.id):
+        await cb.answer("Только мастера могут принимать заявки.", show_alert=True)
+        return
+    order_id = int(cb.data.replace("take_", ""))
+    success  = db_assign_master(order_id, cb.from_user.id, cb.from_user.full_name)
+
+    if not success:
+        await cb.answer("Заявка уже взята другим мастером!", show_alert=True)
+        await cb.message.edit_reply_markup(reply_markup=None)
+        return
+
+    # Мастеру — подтверждение с кнопкой "Выполнено"
+    await cb.message.edit_text(
+        cb.message.text + f"\n\n✅ Ты принял эту заявку!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отметить выполненной", callback_data=f"mdone_{order_id}")]
+        ])
+    )
+    await cb.answer("Заявка принята! Удачи 💪")
+
+    # Клиенту — уведомление
+    order = db_get_order(order_id)
+    if order:
+        try:
+            await bot.send_message(
+                order[1],
+                f"🔧 По вашей заявке #{order_id} назначен мастер!\n\n"
+                f"Мастер: {cb.from_user.full_name}\n"
+                f"Скоро свяжется с вами.\n\nВопросы? Звоните: {PHONE}"
+            )
+        except Exception:
+            pass
+
+    # Владельцу — уведомление
+    await bot.send_message(OWNER_ID, f"✅ Мастер {cb.from_user.full_name} взял заявку #{order_id}")
+
+    # Остальным мастерам — сообщение что заявка занята
+    for master_id in MASTER_IDS:
+        if master_id != cb.from_user.id:
+            try:
+                await bot.send_message(master_id, f"ℹ️ Заявка #{order_id} уже взята мастером {cb.from_user.full_name}.")
+            except Exception:
+                pass
+
+@dp.callback_query(F.data.startswith("skip_"))
+async def master_skip_order(cb: CallbackQuery):
+    if not is_master(cb.from_user.id):
+        return
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer("Понял, пропускаем.")
+
+@dp.callback_query(F.data.startswith("mdone_"))
+async def master_done_order(cb: CallbackQuery):
+    if not is_master(cb.from_user.id):
+        return
+    order_id = int(cb.data.replace("mdone_", ""))
+    order    = db_get_order(order_id)
+    if not order or order[5] != cb.from_user.id:
+        await cb.answer("Это не твоя заявка.", show_alert=True)
+        return
+    await _apply_status(cb.message, order_id, "выполнено", user_id=order[1])
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer("Отлично! Заявка выполнена ✅")
+
+# ─── КОМАНДЫ ВЛАДЕЛЬЦА ────────────────────────────────────────────────────────
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     if message.from_user.id != OWNER_ID:
@@ -483,6 +674,32 @@ async def cmd_week(message: Message):
         return
     await message.answer(db_get_weekly_stats())
 
+@dp.message(Command("masters"))
+async def cmd_masters(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    with db_connect() as con:
+        rows = con.execute("SELECT id, name, username, registered_at FROM masters").fetchall()
+    if not rows:
+        await message.answer(
+            "Мастеров пока нет.\n\n"
+            "Чтобы добавить мастера:\n"
+            "1. Узнай его Telegram ID (через @userinfobot)\n"
+            "2. Добавь ID в список MASTER_IDS в коде\n"
+            "3. Передеплой бота"
+        )
+        return
+    text = f"👷 Мастера ({len(rows)}):\n\n"
+    for row in rows:
+        mid, name, username, reg = row
+        tag = f"@{username}" if username else f"ID: {mid}"
+        with db_connect() as con:
+            done = con.execute(
+                "SELECT COUNT(*) FROM orders WHERE master_id=? AND status='выполнено'", (mid,)
+            ).fetchone()[0]
+        text += f"👤 {name} ({tag})\n   Выполнено: {done} заявок\n   С нами с: {reg}\n\n"
+    await message.answer(text)
+
 @dp.message(Command("orders"))
 async def cmd_orders(message: Message):
     if message.from_user.id != OWNER_ID:
@@ -492,14 +709,15 @@ async def cmd_orders(message: Message):
         await message.answer("Нет активных заявок.")
         return
     for row in rows:
-        order_id, user_id, order_type, status, created_at, name, username = row
-        label  = "РЕГУЛЯРНОЕ" if order_type == "regular" else "РАЗОВЫЙ"
-        tag    = f"@{username}" if username else f"ID {user_id}"
-        emoji  = {"принята": "🆕", "в работе": "🔧"}.get(status, "📋")
+        order_id, user_id, order_type, status, created_at, name, username, master_name = row
+        label      = "РЕГУЛЯРНОЕ" if order_type == "regular" else "РАЗОВЫЙ"
+        tag        = f"@{username}" if username else f"ID {user_id}"
+        emoji      = {"принята": "🆕", "в работе": "🔧"}.get(status, "📋")
+        master_str = f"\nМастер: {master_name}" if master_name else "\nМастер: не назначен"
         await message.answer(
             f"{emoji} Заявка #{order_id} — {label}\n"
             f"Клиент: {name} ({tag})\n"
-            f"Статус: {status}\n"
+            f"Статус: {status}{master_str}\n"
             f"Создана: {created_at}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="▶️ В работу",         callback_data=f"ss_{order_id}_{user_id}_inwork")],
@@ -515,7 +733,7 @@ async def cmd_set_status(message: Message):
         return
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
-        await message.answer("Формат: /status [номер заявки] [статус]")
+        await message.answer("Формат: /status [номер] [статус]")
         return
     try:
         order_id = int(parts[1])
@@ -524,7 +742,7 @@ async def cmd_set_status(message: Message):
         return
     status = parts[2].strip().lower()
     if status not in ORDER_STATUSES:
-        await message.answer(f"Неверный статус. Доступные: {', '.join(ORDER_STATUSES.keys())}")
+        await message.answer(f"Статусы: {', '.join(ORDER_STATUSES.keys())}")
         return
     await _apply_status(message, order_id, status)
 
@@ -536,12 +754,11 @@ async def cmd_broadcast(message: Message):
     if len(parts) < 2:
         await message.answer("Формат: /broadcast Текст сообщения")
         return
-    text     = parts[1]
     user_ids = db_get_all_user_ids()
     sent, failed = 0, 0
     for uid in user_ids:
         try:
-            await bot.send_message(uid, text)
+            await bot.send_message(uid, parts[1])
             sent += 1
         except Exception:
             failed += 1
@@ -552,20 +769,34 @@ async def cmd_prices(message: Message):
     text = "💰 Прайс — Разовые работы\n\n"
     for svc in ONETIME_SERVICES.values():
         text += f"{svc['name']}\n{svc['price']} — {svc['time']}\n\n"
-    text += "Точная стоимость — после фото или описания"
     await message.answer(text)
 
 @dp.message(Command("contacts"))
 async def cmd_contacts(message: Message):
-    await message.answer(
-        f"📍 Контакты Хаус Мастер\n\n"
-        f"Телефон: {PHONE}\n"
-        f"Зона работы: {CITY}\n\n"
-        f"Пн-Сб 8:00-21:00\n"
-        f"Экстренные вызовы — круглосуточно"
-    )
+    await message.answer(f"📍 Хаус Мастер\nТелефон: {PHONE}\nЗона: {CITY}\nПн-Сб 8:00-21:00")
 
-# ─── УПРАВЛЕНИЕ СТАТУСАМИ (КНОПКИ) ───────────────────────────────────────────
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if message.from_user.id == OWNER_ID:
+        await message.answer(
+            "Команды владельца:\n\n"
+            "/orders — активные заявки\n"
+            "/stats — статистика\n"
+            "/week — сводка за 7 дней\n"
+            "/masters — список мастеров\n"
+            "/status [№] [статус] — сменить статус\n"
+            "/broadcast [текст] — рассылка\n\n"
+            "Статусы: принята, в работе, выполнено, отменена"
+        )
+    elif is_master(message.from_user.id):
+        await message.answer("Команды мастера:\n/start — главное меню", reply_markup=kb_master_main())
+    else:
+        await message.answer(
+            "/start — главное меню\n/prices — прайс\n/contacts — контакты",
+            reply_markup=kb_main()
+        )
+
+# ─── УПРАВЛЕНИЕ СТАТУСАМИ ─────────────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("ss_"))
 async def cb_set_status(cb: CallbackQuery):
     if cb.from_user.id != OWNER_ID:
@@ -590,21 +821,18 @@ async def _apply_status(msg, order_id: int, status: str, user_id: int = None):
     try:
         await bot.send_message(
             client_id,
-            f"📋 Заявка #{order_id}\n\n"
-            f"Статус изменён: {status_text}\n\n"
-            f"Вопросы? Звоните: {PHONE}"
+            f"📋 Заявка #{order_id}\nСтатус: {status_text}\n\nВопросы? Звоните: {PHONE}"
         )
         if status == "выполнено":
             await bot.send_message(
                 client_id,
-                "Оцените работу мастера — это займёт 30 секунд:",
+                "Оцените работу мастера:",
                 reply_markup=kb_rating(order_id)
             )
     except Exception:
         pass
-    await msg.answer(f"Статус заявки #{order_id} изменён на «{status}», клиент уведомлён.")
+    await msg.answer(f"Статус заявки #{order_id} → «{status}», клиент уведомлён.")
 
-# ─── СООБЩЕНИЯ КЛИЕНТУ ────────────────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("msg_"))
 async def cb_message_client(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != OWNER_ID:
@@ -639,11 +867,9 @@ async def send_message_to_client(message: Message, state: FSMContext):
     try:
         await bot.send_message(
             user_id,
-            f"💬 Сообщение от Хаус Мастер по заявке #{order_id}:\n\n"
-            f"{message.text}\n\n"
-            f"Вопросы? Звоните: {PHONE}"
+            f"💬 Сообщение от Хаус Мастер по заявке #{order_id}:\n\n{message.text}\n\nЗвоните: {PHONE}"
         )
-        await message.answer(f"Сообщение отправлено клиенту по заявке #{order_id}.")
+        await message.answer(f"Сообщение отправлено клиенту.")
     except Exception:
         await message.answer("Не удалось отправить — клиент заблокировал бота.")
 
@@ -663,9 +889,7 @@ async def choose_service(cb: CallbackQuery, state: FSMContext):
     await state.update_data(service=key)
     await state.set_state(Order.choosing_urgency)
     await cb.message.answer(
-        f"Выбрано: {svc['name']}\n"
-        f"Цена: {svc['price']} — {svc['time']}\n\n"
-        "Выберите срочность:",
+        f"Выбрано: {svc['name']}\nЦена: {svc['price']} — {svc['time']}\n\nВыберите срочность:",
         reply_markup=kb_urgency()
     )
     await cb.answer()
@@ -675,9 +899,7 @@ async def choose_urgency(cb: CallbackQuery, state: FSMContext):
     key = cb.data.replace("urg_", "")
     await state.update_data(urgency=key)
     await state.set_state(Order.entering_address)
-    await cb.message.answer(
-        f"Срочность: {URGENCY[key]['name']}\n\nУкажите адрес (улица, дом, квартира):"
-    )
+    await cb.message.answer(f"Срочность: {URGENCY[key]['name']}\n\nУкажите адрес (улица, дом, квартира):")
     await cb.answer()
 
 # ─── РЕГУЛЯРНОЕ ОБСЛУЖИВАНИЕ ──────────────────────────────────────────────────
@@ -687,8 +909,7 @@ async def start_regular(cb: CallbackQuery, state: FSMContext):
     await state.update_data(order_type="regular")
     await state.set_state(Order.choosing_regular)
     await cb.message.answer(
-        "Регулярное обслуживание — мастер приезжает по расписанию и устраняет всё, что накопилось.\n\n"
-        "Выберите пакет:",
+        "Регулярное обслуживание — мастер приезжает по расписанию.\n\nВыберите пакет:",
         reply_markup=kb_regular_services()
     )
     await cb.answer()
@@ -700,10 +921,7 @@ async def choose_regular(cb: CallbackQuery, state: FSMContext):
     await state.update_data(regular_service=key)
     await state.set_state(Order.entering_address)
     await cb.message.answer(
-        f"Выбрано: {svc['name']}\n"
-        f"Стоимость: {svc['price']}\n"
-        f"Периодичность: {svc['visits']}\n\n"
-        "Укажите адрес объекта:"
+        f"Выбрано: {svc['name']}\nСтоимость: {svc['price']}\nПериодичность: {svc['visits']}\n\nУкажите адрес объекта:"
     )
     await cb.answer()
 
@@ -712,7 +930,7 @@ async def choose_regular(cb: CallbackQuery, state: FSMContext):
 async def enter_address(message: Message, state: FSMContext):
     await state.update_data(address=message.text)
     await state.set_state(Order.entering_phone)
-    await message.answer("Укажите номер телефона для связи:", reply_markup=kb_phone())
+    await message.answer("Укажите номер телефона:", reply_markup=kb_phone())
 
 @dp.message(Order.entering_phone, F.contact)
 async def enter_phone_contact(message: Message, state: FSMContext):
@@ -766,27 +984,24 @@ async def enter_comment(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "confirm_yes", Order.confirm)
 async def confirm_order(cb: CallbackQuery, state: FSMContext):
     data     = await state.get_data()
-    summary  = order_summary(data)
-    order_id = db_add_order(cb.from_user.id, data.get("order_type", "onetime"), summary)
+    order_id = db_add_order(cb.from_user.id, data.get("order_type", "onetime"), order_summary(data))
     await notify_owner(data, cb.from_user, order_id)
+    await notify_masters(data, cb.from_user, order_id)
     await state.clear()
 
-    order_type = data.get("order_type", "onetime")
-    if order_type == "onetime":
+    if data.get("order_type") == "onetime":
         svc = ONETIME_SERVICES.get(data.get("service", ""), {})
         urg = URGENCY.get(data.get("urgency", "standard"), {})
-        price_hint = f"\nПримерная стоимость: {svc.get('price', '')} ({urg.get('mult', '')})\n"
+        price_hint = f"\nПримерная стоимость: {svc.get('price','')} ({urg.get('mult','')})\n"
         extra = "Можете прислать фото — поможет точнее назвать стоимость.\n\n"
     else:
         svc = REGULAR_SERVICES.get(data.get("regular_service", ""), {})
-        price_hint = f"\nСтоимость: {svc.get('price', '')}\n"
-        extra = "Мы свяжемся для согласования расписания визитов.\n\n"
+        price_hint = f"\nСтоимость: {svc.get('price','')}\n"
+        extra = "Свяжемся для согласования расписания визитов.\n\n"
 
     await cb.message.answer(
-        f"✅ Заявка #{order_id} принята!\n"
-        f"{price_hint}\n"
-        f"Свяжемся с вами в течение 15 минут.\n\n"
-        f"{extra}"
+        f"✅ Заявка #{order_id} принята!\n{price_hint}\n"
+        f"Мастер свяжется с вами в ближайшее время.\n\n{extra}"
         f"Спасибо, что выбрали Хаус Мастер! 🏠",
         reply_markup=kb_main()
     )
@@ -802,10 +1017,7 @@ async def callback_request(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.update_data(order_type="callback")
     await state.set_state(Order.entering_phone)
-    await cb.message.answer(
-        "Оставьте номер — перезвоним в течение 15 минут:",
-        reply_markup=kb_phone()
-    )
+    await cb.message.answer("Оставьте номер — перезвоним в течение 15 минут:", reply_markup=kb_phone())
     await cb.answer()
 
 async def _handle_callback(message: Message, phone: str, state: FSMContext):
@@ -814,18 +1026,12 @@ async def _handle_callback(message: Message, phone: str, state: FSMContext):
     tag = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
     await bot.send_message(
         OWNER_ID,
-        f"📞 ПЕРЕЗВОНИТЬ!\n\n"
-        f"Клиент: {message.from_user.full_name} ({tag})\n"
-        f"Телефон: {phone}\n"
-        f"Время: {now}",
+        f"📞 ПЕРЕЗВОНИТЬ!\n\nКлиент: {message.from_user.full_name} ({tag})\nТелефон: {phone}\nВремя: {now}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Написать клиенту", callback_data=f"msg_0_{message.from_user.id}")]
         ])
     )
-    await message.answer(
-        "Отлично! Перезвоним в течение 15 минут. 📞",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await message.answer("Перезвоним в течение 15 минут! 📞", reply_markup=ReplyKeyboardRemove())
     await message.answer("Главное меню:", reply_markup=kb_main())
 
 # ─── МОИ ЗАЯВКИ ───────────────────────────────────────────────────────────────
@@ -836,17 +1042,18 @@ async def my_orders(cb: CallbackQuery):
         await cb.message.answer(
             "У вас пока нет заявок.\n\nОставьте первую — ответим в течение 15 минут!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔧 Оставить заявку",  callback_data="start_onetime")],
-                [InlineKeyboardButton(text="⬅️ Главное меню",     callback_data="back_main")],
+                [InlineKeyboardButton(text="🔧 Оставить заявку", callback_data="start_onetime")],
+                [InlineKeyboardButton(text="⬅️ Главное меню",    callback_data="back_main")],
             ])
         )
         return
     emoji_map = {"принята": "🆕", "в работе": "🔧", "выполнено": "✅", "отменена": "❌"}
     text = "Ваши заявки:\n\n"
     for row in rows:
-        order_id, order_type, status, created_at = row
-        label = "Регулярное" if order_type == "regular" else "Разовый"
-        text += f"{emoji_map.get(status,'📋')} #{order_id} — {label}\n   Статус: {status}\n   Дата: {created_at}\n\n"
+        order_id, order_type, status, created_at, master_name = row
+        label  = "Регулярное" if order_type == "regular" else "Разовый"
+        master = f"\n   Мастер: {master_name}" if master_name else ""
+        text  += f"{emoji_map.get(status,'📋')} #{order_id} — {label}\n   Статус: {status}{master}\n   Дата: {created_at}\n\n"
     await cb.message.answer(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -856,7 +1063,7 @@ async def my_orders(cb: CallbackQuery):
     )
     await cb.answer()
 
-# ─── ПРАЙС / КОНТАКТЫ ─────────────────────────────────────────────────────────
+# ─── ПРАЙС / КОНТАКТЫ / МЕНЮ ──────────────────────────────────────────────────
 @dp.callback_query(F.data == "show_prices")
 async def show_prices(cb: CallbackQuery):
     text = "💰 Прайс — Разовые работы\n\n"
@@ -872,11 +1079,7 @@ async def show_prices(cb: CallbackQuery):
 @dp.callback_query(F.data == "call_us")
 async def call_us(cb: CallbackQuery):
     await cb.message.answer(
-        f"☎️ Позвоните нам:\n\n"
-        f"{PHONE}\n\n"
-        f"Пн-Сб 8:00-21:00\n"
-        f"Экстренные выезды — круглосуточно\n\n"
-        f"Или оставьте заявку — перезвоним:",
+        f"☎️ Позвоните нам:\n\n{PHONE}\n\nПн-Сб 8:00-21:00\nЭкстренные выезды — круглосуточно",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔧 Оставить заявку", callback_data="start_onetime")],
             [InlineKeyboardButton(text="⬅️ Главное меню",   callback_data="back_main")],
@@ -887,7 +1090,10 @@ async def call_us(cb: CallbackQuery):
 @dp.callback_query(F.data == "back_main")
 async def back_main(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.answer("Главное меню:", reply_markup=kb_main())
+    if is_master(cb.from_user.id):
+        await cb.message.answer("Меню мастера:", reply_markup=kb_master_main())
+    else:
+        await cb.message.answer("Главное меню:", reply_markup=kb_main())
     await cb.answer()
 
 # ─── ФОТО ─────────────────────────────────────────────────────────────────────
@@ -896,24 +1102,20 @@ async def handle_photo(message: Message):
     await bot.forward_message(OWNER_ID, message.chat.id, message.message_id)
     with db_connect() as con:
         row = con.execute(
-            """SELECT id FROM orders
-               WHERE user_id=? AND status NOT IN ('выполнено','отменена')
-               ORDER BY created_at DESC LIMIT 1""",
+            "SELECT id FROM orders WHERE user_id=? AND status NOT IN ('выполнено','отменена') ORDER BY created_at DESC LIMIT 1",
             (message.from_user.id,)
         ).fetchone()
     if row:
-        order_id = row[0]
-        await bot.send_message(OWNER_ID, f"📸 Фото от {message.from_user.full_name} к заявке #{order_id}")
+        await bot.send_message(OWNER_ID, f"📸 Фото от {message.from_user.full_name} к заявке #{row[0]}")
         await message.answer(
-            f"Фото прикреплено к заявке #{order_id}.\nМастер свяжется в течение 15 минут.",
+            f"Фото прикреплено к заявке #{row[0]}. Мастер свяжется в ближайшее время.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Главное меню", callback_data="back_main")]
             ])
         )
     else:
         await bot.send_message(OWNER_ID, f"📸 Фото от {message.from_user.full_name} (без заявки)")
-        await message.answer(
-            "Фото получено! Оценим и свяжемся в течение 15 минут.",
+        await message.answer("Фото получено! Оценим и свяжемся в течение 15 минут.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Главное меню", callback_data="back_main")]
             ])
@@ -933,9 +1135,8 @@ async def handle_review(cb: CallbackQuery, state: FSMContext):
         rating = int(action)
         await state.update_data(review_rating=rating, review_order_id=order_id)
         await state.set_state(Review.waiting_comment)
-        stars = "⭐" * rating
         await cb.message.answer(
-            f"Спасибо за оценку {stars}!\n\nОставьте комментарий или нажмите Пропустить:",
+            f"Спасибо за оценку {'⭐' * rating}!\n\nОставьте комментарий или нажмите Пропустить:",
             reply_markup=kb_review_comment()
         )
     await cb.answer()
@@ -945,12 +1146,10 @@ async def review_comment_skip(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     db_add_review(cb.from_user.id, data.get("review_order_id", 0), data.get("review_rating", 5), "")
     await state.clear()
-    await cb.message.answer("Спасибо за отзыв! Это очень важно для нас. 🙏", reply_markup=kb_main())
-    await bot.send_message(
-        OWNER_ID,
-        f"⭐ Новый отзыв от {cb.from_user.full_name}:\n"
-        f"Оценка: {'⭐' * data.get('review_rating', 5)}\n"
-        f"Заявка #{data.get('review_order_id', '?')}"
+    await cb.message.answer("Спасибо за отзыв! 🙏", reply_markup=kb_main())
+    await bot.send_message(OWNER_ID,
+        f"⭐ Отзыв от {cb.from_user.full_name}:\n"
+        f"Оценка: {'⭐' * data.get('review_rating', 5)}\nЗаявка #{data.get('review_order_id','?')}"
     )
     await cb.answer()
 
@@ -959,13 +1158,11 @@ async def review_comment(message: Message, state: FSMContext):
     data = await state.get_data()
     db_add_review(message.from_user.id, data.get("review_order_id", 0), data.get("review_rating", 5), message.text)
     await state.clear()
-    await message.answer("Спасибо за отзыв! Это очень важно для нас. 🙏", reply_markup=kb_main())
-    await bot.send_message(
-        OWNER_ID,
-        f"⭐ Новый отзыв от {message.from_user.full_name}:\n"
+    await message.answer("Спасибо за отзыв! 🙏", reply_markup=kb_main())
+    await bot.send_message(OWNER_ID,
+        f"⭐ Отзыв от {message.from_user.full_name}:\n"
         f"Оценка: {'⭐' * data.get('review_rating', 5)}\n"
-        f"Комментарий: {message.text}\n"
-        f"Заявка #{data.get('review_order_id', '?')}"
+        f"Комментарий: {message.text}\nЗаявка #{data.get('review_order_id','?')}"
     )
 
 # ─── FALLBACK ─────────────────────────────────────────────────────────────────
@@ -973,11 +1170,13 @@ async def review_comment(message: Message, state: FSMContext):
 async def fallback(message: Message, state: FSMContext):
     if await state.get_state():
         return
+    if is_master(message.from_user.id):
+        await message.answer("Меню мастера:", reply_markup=kb_master_main())
+        return
     await message.answer("Воспользуйтесь меню:", reply_markup=kb_main())
 
 # ─── ФОНОВЫЕ ЗАДАЧИ ───────────────────────────────────────────────────────────
 async def reminder_task():
-    """Каждые 30 минут проверяем заявки, висящие > 2 часов"""
     await asyncio.sleep(60)
     while True:
         try:
@@ -986,10 +1185,7 @@ async def reminder_task():
                 label = "РЕГУЛЯРНОЕ" if order["type"] == "regular" else "РАЗОВЫЙ"
                 await bot.send_message(
                     OWNER_ID,
-                    f"⏰ НАПОМИНАНИЕ\n\n"
-                    f"Заявка #{order['id']} ({label}) висит без ответа!\n"
-                    f"Создана: {order['created_at']}\n\n"
-                    f"Свяжись с клиентом.",
+                    f"⏰ НАПОМИНАНИЕ\n\nЗаявка #{order['id']} ({label}) без мастера уже 2 часа!\nСоздана: {order['created_at']}",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text="▶️ В работу", callback_data=f"ss_{order['id']}_{order['user_id']}_inwork")],
                         [InlineKeyboardButton(text="❌ Отменить", callback_data=f"ss_{order['id']}_{order['user_id']}_cancel")],
@@ -1000,12 +1196,11 @@ async def reminder_task():
         await asyncio.sleep(30 * 60)
 
 async def weekly_report_task():
-    """Еженедельная сводка каждый понедельник в 9:00"""
     while True:
         now = datetime.now()
-        days_ahead = (7 - now.weekday()) % 7 or 7
-        next_monday = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        next_monday = next_monday.replace(day=now.day + days_ahead)
+        days_ahead   = (7 - now.weekday()) % 7 or 7
+        next_monday  = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        next_monday  = next_monday.replace(day=now.day + days_ahead)
         wait_seconds = (next_monday - now).total_seconds()
         if wait_seconds < 0:
             wait_seconds += 7 * 24 * 3600
@@ -1018,7 +1213,7 @@ async def weekly_report_task():
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 async def main():
     db_init()
-    print("🏠 Хаус Мастер Bot v1.0 запущен!")
+    print("🏠 Хаус Мастер Bot v2.0 запущен!")
     asyncio.create_task(reminder_task())
     asyncio.create_task(weekly_report_task())
     await dp.start_polling(bot, skip_updates=True)
