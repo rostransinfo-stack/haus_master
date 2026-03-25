@@ -1,11 +1,12 @@
 """
-Хаус Мастер — Telegram Bot v2.0
+Хаус Мастер — Telegram Bot v2.1
 
 + SQLite база данных
 + Два типа заявок: разовый ремонт и регулярное обслуживание
 + Роль исполнителя (мастера) — принимает/отказывается от заявок
 + Распределение заявок между мастерами (кто первый принял)
 + Статусы заявок с уведомлением клиенту
++ Геолокация — клиент отправляет точку на карте
 + Отзыв после выполнения
 + Рассылка всем пользователям
 + Напоминание владельцу если заявка висит 2 часа
@@ -376,6 +377,9 @@ async def notify_owner(data: dict, user, order_id: int):
         + order_summary(data),
         reply_markup=kb
     )
+    # Если есть геолокация — отправляем точку на карте
+    if data.get("lat") and data.get("lon"):
+        await bot.send_location(OWNER_ID, latitude=data["lat"], longitude=data["lon"])
 
 async def notify_masters(data: dict, user, order_id: int):
     """Разослать заявку всем мастерам — кто первый нажмёт, тот берёт."""
@@ -404,6 +408,9 @@ async def notify_masters(data: dict, user, order_id: int):
     for master_id in MASTER_IDS:
         try:
             await bot.send_message(master_id, text, reply_markup=kb)
+            # Если есть геолокация — отправляем точку на карте
+            if data.get("lat") and data.get("lon"):
+                await bot.send_location(master_id, latitude=data["lat"], longitude=data["lon"])
         except Exception as e:
             logging.warning(f"Не удалось уведомить мастера {master_id}: {e}")
 
@@ -476,6 +483,15 @@ def kb_confirm():
 def kb_phone():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Отправить мой номер", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+
+def kb_address():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Отправить геолокацию", request_location=True)],
+            [KeyboardButton(text="✏️ Ввести адрес вручную")],
+        ],
         resize_keyboard=True, one_time_keyboard=True
     )
 
@@ -899,7 +915,10 @@ async def choose_urgency(cb: CallbackQuery, state: FSMContext):
     key = cb.data.replace("urg_", "")
     await state.update_data(urgency=key)
     await state.set_state(Order.entering_address)
-    await cb.message.answer(f"Срочность: {URGENCY[key]['name']}\n\nУкажите адрес (улица, дом, квартира):")
+    await cb.message.answer(
+        f"Срочность: {URGENCY[key]['name']}\n\nУкажите адрес объекта:",
+        reply_markup=kb_address()
+    )
     await cb.answer()
 
 # ─── РЕГУЛЯРНОЕ ОБСЛУЖИВАНИЕ ──────────────────────────────────────────────────
@@ -921,16 +940,44 @@ async def choose_regular(cb: CallbackQuery, state: FSMContext):
     await state.update_data(regular_service=key)
     await state.set_state(Order.entering_address)
     await cb.message.answer(
-        f"Выбрано: {svc['name']}\nСтоимость: {svc['price']}\nПериодичность: {svc['visits']}\n\nУкажите адрес объекта:"
+        f"Выбрано: {svc['name']}\nСтоимость: {svc['price']}\nПериодичность: {svc['visits']}\n\nУкажите адрес объекта:",
+        reply_markup=kb_address()
     )
     await cb.answer()
 
 # ─── ОБЩИЙ СБОР ДАННЫХ ────────────────────────────────────────────────────────
 @dp.message(Order.entering_address)
 async def enter_address(message: Message, state: FSMContext):
-    await state.update_data(address=message.text)
-    await state.set_state(Order.entering_phone)
-    await message.answer("Укажите номер телефона:", reply_markup=kb_phone())
+    # Если пришла геолокация
+    if message.location:
+        lat = message.location.latitude
+        lon = message.location.longitude
+        address = f"📍 Геолокация: {lat}, {lon}"
+        await state.update_data(address=address, lat=lat, lon=lon)
+        await message.answer(
+            "Геолокация получена ✅\n\nУкажите номер телефона:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await message.answer("👇", reply_markup=kb_phone())
+        await state.set_state(Order.entering_phone)
+        return
+
+    # Кнопка "Ввести вручную" или просто текст
+    if message.text and message.text != "✏️ Ввести адрес вручную":
+        await state.update_data(address=message.text)
+        await message.answer(
+            "Адрес принят ✅\n\nУкажите номер телефона:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await message.answer("👇", reply_markup=kb_phone())
+        await state.set_state(Order.entering_phone)
+        return
+
+    # Кнопка "Ввести вручную"
+    await message.answer(
+        "Введите адрес текстом (улица, дом, квартира):",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
 @dp.message(Order.entering_phone, F.contact)
 async def enter_phone_contact(message: Message, state: FSMContext):
